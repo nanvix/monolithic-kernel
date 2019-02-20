@@ -1,6 +1,6 @@
 /*
  * Copyright(C) 2011-2016 Pedro H. Penna   <pedrohenriquepenna@gmail.com>
- *              2015-2016 Davidson Francis <davidsondfgl@gmail.com> 
+ *              2015-2018 Davidson Francis <davidsondfgl@gmail.com> 
  *
  * This file is part of Nanvix.
  * 
@@ -25,6 +25,7 @@
 #include <nanvix/klib.h>
 #include <nanvix/mm.h>
 #include <nanvix/region.h>
+#include <nanvix/smp.h>
 #include "mm.h"
 
 /*============================================================================*
@@ -231,6 +232,21 @@ PRIVATE inline int pte_is_clear(struct pte *pte)
 }
 
 /**
+ * @brief Asserts if a start of a zone is cleared.
+ *
+ * @param proc  Process in which the addr should be checked.
+ * @param start Zone address start.
+ *
+ * @returns Non zero if the page is cleared, and zero otherwise.
+ */
+PUBLIC int addr_is_clear(struct process *proc, addr_t start)
+{
+	struct pde *pde;
+	pde = &proc->pgdir[PGTAB(start)];
+    return !pde_is_present(pde);
+}
+
+/**
  * @brief Maps a page table into user address space.
  * 
  * @param proc  Process in which the page table should be mapped.
@@ -253,7 +269,10 @@ PUBLIC void mappgtab(struct process *proc, addr_t addr, void *pgtab)
 	
 	/* Flush changes. */
 	if (proc == curr_proc)
+	{
 		tlb_flush();
+		cpus[curr_core].curr_thread->tlb_flush = 1;
+	}
 }
 
 /**
@@ -279,7 +298,10 @@ PUBLIC void umappgtab(struct process *proc, addr_t addr)
 	
 	/* Flush changes. */
 	if (proc == curr_proc)
+	{
 		tlb_flush();
+		cpus[curr_core].curr_thread->tlb_flush = 1;
+	}
 }
 
 /**
@@ -293,6 +315,7 @@ PUBLIC void umappgtab(struct process *proc, addr_t addr)
 PUBLIC int crtpgdir(struct process *proc)
 {
 	void *kstack;             /* Kernel stack.     */
+	void *ipikstack;          /* IPI Kernel stack. */
 	struct pde *pgdir;        /* Page directory.   */
 	struct intstack *s1, *s2; /* Interrupt stacks. */
 	
@@ -306,38 +329,64 @@ PUBLIC int crtpgdir(struct process *proc)
 	if (kstack == NULL)
 		goto err1;
 
+	/* Get kernel page for IPI kernel stack. */
+	ipikstack = getkpg(1);
+	if (ipikstack == NULL)
+		goto err2;
+
 	/* Build page directory. */
 	pgdir[0] = curr_proc->pgdir[0];
 	pgdir[PGTAB(KBASE_VIRT)] = curr_proc->pgdir[PGTAB(KBASE_VIRT)];
 	pgdir[PGTAB(KPOOL_VIRT)] = curr_proc->pgdir[PGTAB(KPOOL_VIRT)];
 	pgdir[PGTAB(INITRD_VIRT)] = curr_proc->pgdir[PGTAB(INITRD_VIRT)];
 	pgdir[PGTAB(SERIAL_VIRT)] = curr_proc->pgdir[PGTAB(SERIAL_VIRT)];
+#ifdef or1k
+	pgdir[PGTAB(OMPIC_VIRT)] = curr_proc->pgdir[PGTAB(OMPIC_VIRT)];
+#endif
 	
 	/* Clone kernel stack. */
-	kmemcpy(kstack, curr_proc->kstack, KSTACK_SIZE);
+	kmemcpy(kstack, cpus[curr_core].curr_thread->kstack, KSTACK_SIZE);
 	
 	/* Adjust stack pointers. */
-	proc->kesp = (curr_proc->kesp -(dword_t)curr_proc->kstack)+(dword_t)kstack;
-	s1 = (struct intstack *) proc->kesp;
-	s1->old_kesp = proc->kesp;
+	proc->threads->kesp = (cpus[curr_core].curr_thread->kesp -
+		(dword_t)cpus[curr_core].curr_thread->kstack)+(dword_t)kstack;
+	
+	s1 = (struct intstack *) proc->threads->kesp;
+	s1->old_kesp = proc->threads->kesp;
 	
 	if (curr_proc == IDLE)
 	{
-		s1 = (struct intstack *) curr_proc->kesp;
-		s2 = (struct intstack *) proc->kesp;
-#ifdef i386		
-		s2->ebp = (s1->ebp - (dword_t)curr_proc->kstack) + (dword_t)kstack;
+		s1 = (struct intstack *) cpus[curr_core].curr_thread->kesp;
+		s2 = (struct intstack *) proc->threads->kesp;
+#ifdef i386
+		s2->ebp = (s1->ebp - (dword_t)cpus[curr_core].curr_thread->kstack)
+			+ (dword_t)kstack;
+		
+		*(dword_t *)s2->ebp = *(dword_t *)s2->ebp -
+			(dword_t)cpus[curr_core].curr_thread->kstack + (dword_t)kstack;
 #elif or1k
-		s2->gpr[2] = (s1->gpr[2] - (dword_t)curr_proc->kstack) + (dword_t)kstack;
+		s2->gpr[1] = (s1->gpr[1] - (dword_t)cpus[curr_core].curr_thread->kstack)
+			+ (dword_t)kstack;
+		
+		s2->gpr[2] = (s1->gpr[2] - (dword_t)cpus[curr_core].curr_thread->kstack)
+			+ (dword_t)kstack;
+
+		*(dword_t *)(s2->gpr[2] - sizeof(dword_t)) = *(dword_t *)(s2->gpr[2]
+			- sizeof(dword_t)) - (dword_t)cpus[curr_core].curr_thread->kstack
+			+ (dword_t)kstack;
 #endif
 	}
+
 	/* Assign page directory. */
 	proc->cr3 = ADDR(pgdir) - KBASE_VIRT;
 	proc->pgdir = pgdir;
-	proc->kstack = kstack;
-	
+	proc->threads->kstack = kstack;
+	proc->threads->ipikstack = ipikstack;
+
 	return (0);
 
+err2:
+	putkpg(kstack);
 err1:
 	putkpg(pgdir);
 err0:
@@ -393,7 +442,9 @@ PRIVATE int allocupg(addr_t vaddr, int writable)
 	pg = getpte(curr_proc, vaddr);
 	pte_init(pg, writable);
 	pg->frame = paddr;
+	
 	tlb_flush();
+	cpus[curr_core].curr_thread->tlb_flush = 1;
 	
 	kmemset((void *)(vaddr), 0, PAGE_SIZE);
 	
@@ -466,7 +517,9 @@ PUBLIC void freeupg(struct pte *pg)
 
 done:
 	pte_clear(pg);
+
 	tlb_flush();
+	cpus[curr_core].curr_thread->tlb_flush = 1;
 }
 
 /**
@@ -528,7 +581,9 @@ PRIVATE int cow_disable(struct pte *pg)
 
 	pte_cow_set(pg, 0);
 	pte_write_set(pg, 1);
+	
 	tlb_flush();
+	cpus[curr_core].curr_thread->tlb_flush = 1;
 
 	return (0);
 }
@@ -588,7 +643,19 @@ PUBLIC void linkupg(struct pte *upg1, struct pte *upg2)
  */
 PUBLIC void dstrypgdir(struct process *proc)
 {
-	putkpg(proc->kstack);
+	struct thread *t;
+
+	/*
+	 * Force freeing of kstack of threads that haven't cleaned themselves
+	 * beforehand.
+	 */
+	t = proc->threads;
+	while (t != NULL)
+	{
+		putkpg(t->kstack);
+		putkpg(t->ipikstack);
+		t = t->next;
+	}
 	putkpg(proc->pgdir);
 }
 
@@ -605,6 +672,7 @@ PUBLIC int vfault(addr_t addr)
 	struct pte *pg;       /* Working page.           */
 	struct region *reg;   /* Working region.         */
 	struct pregion *preg; /* Working process region. */
+	struct thread *thrd;  /* Working thread.         */
 
 	/* Get process region. */
 	if ((preg = findreg(curr_proc, addr)) != NULL)
@@ -622,8 +690,15 @@ PUBLIC int vfault(addr_t addr)
 		lockreg(reg = preg->reg);
 
 		/* Not a stack region. */
-		if (preg != STACK(curr_proc))
-			goto error1;
+		thrd = curr_proc->threads;
+		while (thrd != NULL)
+		{
+			if (preg == &thrd->pregs)
+				goto stack_reg;
+			thrd = thrd->next;
+		}
+		goto error1;
+stack_reg:
 
 		/* Expand region. */
 		if (growreg(curr_proc, preg, PAGE_SIZE))

@@ -26,24 +26,31 @@
 #include <or1k/int.h>
 #include <nanvix/mm.h>
 #include <nanvix/pm.h>
+#include <nanvix/smp.h>
 
 /* Exported symbols. */
 .globl gdt_flush
 .globl idt_flush
 .globl tss_flush
 .globl tlb_flush
+.globl setup_interrupts
 .globl enable_interrupts
 .globl disable_interrupts
 .globl halt
 .globl physcpy
 .globl switch_to
 .globl user_mode
+.globl forge_stack
 .globl fpu_init
 .globl pmc_init
 .globl read_pmc
 .globl write_msr
 .globl mfspr
 .globl mtspr
+.globl spin_init
+.globl spin_lock
+.globl spin_unlock
+.globl save_ipi_context
 
 /* Imported symbols. */
 .globl processor_reload
@@ -74,6 +81,36 @@ tlb_flush:
 	l.nop
 
 /*----------------------------------------------------------------------------*
+ *                            setup_interrupts()                              *
+ *----------------------------------------------------------------------------*/
+ 
+/*
+ * Enables and unmask all hardware interrupts.
+ */
+setup_interrupts:
+	
+	/* Increase irqlvl. */
+	LOAD_SYMBOL_2_GPR(r13, cpus)
+	l.mfspr r15, r0,  SPR_COREID
+	l.slli  r15, r15, PERCORE_SIZE_LOG2
+	l.add   r15, r13, r15
+	l.lwz   r13, PERCORE_CURRTHREAD(r15)
+	l.ori   r15, r0,  5
+	l.sw    THRD_IRQLVL(r13), r15
+
+	/* Unmask HW ints. */
+	l.ori   r13, r0, lo((1 << INT_COM1) | (1 << INT_OMPIC))
+	l.mtspr r0, r13, SPR_PICMR
+
+	/* Enable Timer and HW interrupts. */
+	l.mfspr	r13, r0, SPR_SR
+	l.ori	r13, r13, lo(SPR_SR_IEE|SPR_SR_TEE)
+	l.mtspr	r0, r13, SPR_SR
+
+	l.jr r9
+	l.nop
+
+/*----------------------------------------------------------------------------*
  *                            enable_interrupts()                             *
  *----------------------------------------------------------------------------*/
  
@@ -84,15 +121,8 @@ enable_interrupts:
 
 	/* Enable HW interrupts. */
 	l.mfspr	r13, r0, SPR_SR
-	l.ori	r13, r13, lo(SPR_SR_IEE)
+	l.ori	r13, r13, lo(SPR_SR_IEE|SPR_SR_TEE)
 	l.mtspr	r0, r13, SPR_SR
-
-	/* Enable Timer interrupts. */
-	l.mfspr r13, r0, SPR_TTMR
-	l.movhi	r15, hi(SPR_TTMR_IE)
-	l.ori	r15, r15, lo(SPR_TTMR_IE)
-	l.or    r13, r13, r15
-	l.mtspr r0, r13, SPR_TTMR
 
 	l.jr r9
 	l.nop
@@ -108,17 +138,10 @@ disable_interrupts:
 
 	/* Disable HW interrupts. */
 	l.mfspr r15, r0, SPR_SR
-	l.movhi	r13, hi(~(SPR_SR_IEE))
-	l.ori	r13, r13, lo(~(SPR_SR_IEE))
+	l.movhi	r13, hi(~(SPR_SR_IEE|SPR_SR_TEE))
+	l.ori	r13, r13, lo(~(SPR_SR_IEE|SPR_SR_TEE))
 	l.and   r15, r15, r13
 	l.mtspr r0, r15, SPR_SR
-
-	/* Disable Timer interrupts. */
-	l.mfspr r15, r0, SPR_TTMR
-	l.movhi	r13, hi(~(SPR_TTMR_IE))
-	l.ori	r13, r13, lo(~(SPR_TTMR_IE))
-	l.and   r15, r15, r13
-	l.mtspr r0, r15, SPR_TTMR
 
 	l.jr r9
 	l.nop
@@ -216,9 +239,28 @@ switch_to:
 	l.or r9, r31, r0
 
 	/* Save process context. */
-	LOAD_SYMBOL_2_GPR(r13, curr_proc)
-	l.lwz r13, 0(r13)
-	l.lwz r15, PROC_KESP(r13)
+	LOAD_SYMBOL_2_GPR(r13, cpus)
+	l.mfspr r15, r0,  SPR_COREID
+	l.slli  r15, r15, PERCORE_SIZE_LOG2
+	l.add   r15, r13, r15
+
+	l.lwz   r13, PERCORE_CURRTHREAD(r15)
+	l.sfeqi r13, 0
+	l.bf 2f
+	l.nop
+
+	/*
+	 * If smp enabled we should preserve the
+	 * old context and not overwrite.
+	 */
+	LOAD_SYMBOL_2_GPR(r14, smp_enabled)
+	l.lwz   r14, 0(r14)
+	l.sfnei r14, 0
+	l.bf 2f
+	l.nop
+
+1:
+	l.lwz r15, THRD_KESP(r13)
 
 	/* Preserve registers state. */
 	l.addi r1, r1, -60
@@ -237,14 +279,89 @@ switch_to:
 	l.sw 48(r1), r26
 	l.sw 52(r1), r28
 	l.sw 56(r1), r30
-	l.sw PROC_KESP(r13), r1
+	l.sw THRD_KESP(r13), r1
 
-	/* Switch processes. */
-	LOAD_SYMBOL_2_GPR(r13, curr_proc)
-	l.sw 0(r13), r3
+2:
+	/* Switch thread */
+	LOAD_SYMBOL_2_GPR(r14, smp_enabled)
+	l.lwz   r14, 0(r14)
+	l.sfeqi r14, 0
+	l.bf 3f
+	l.nop
 
-	/* Load process context. */
-	l.lwz r1, PROC_KESP(r3)
+	l.mfspr r15, r0,  SPR_COREID
+	l.sfeqi r15, CORE_MASTER
+	l.bf 4f
+	l.nop
+
+3:
+	LOAD_SYMBOL_2_GPR(r14, cpus)
+	l.mfspr r15, r0,  SPR_COREID
+	l.slli  r15, r15, PERCORE_SIZE_LOG2
+	l.add   r15, r14, r15
+	l.addi  r14, r15, PERCORE_CURRTHREAD
+	l.sw 0(r14), r4
+
+4:
+	/**
+	 * Load process context
+	 *
+	 * There are 2 possible contexts to be restored:
+	 * 1) Core master returning from an old
+	 *    IPI context.
+	 *
+	 * 2) Core slave (or master in UP)
+	 *    returning a previous execution.
+	 *
+	 * In the first, the IPI kstack is restored
+	 * and in the later, the normal kernel thread.
+	 */
+	LOAD_SYMBOL_2_GPR(r14, smp_enabled)
+	l.lwz   r14, 0(r14)
+	l.sfeqi r14, 0
+	l.bf 6f
+	l.nop
+
+	l.lwz   r14, THRD_FLAGS(r4)
+	l.andi  r14, r14, (1 << THRD_SYS)
+	l.sfeqi r14, 0
+	l.bf 6f
+	l.nop
+
+	l.jal tlb_flush
+	l.nop
+
+	l.mfspr r14, r0, SPR_COREID
+	l.sfnei r14, CORE_MASTER
+	l.bf 5f
+	l.nop
+
+	/* Master context. */
+	l.lwz r1, THRD_IPISTACK(r4)
+	LOAD_SYMBOL_2_GPR(r14, leave.out)
+	l.jr r14
+	l.nop
+5:
+	/* Slave context. */
+
+	/*
+	 * Since THRD_SYS is set, lets reset as earlier
+	 * as possible here.
+	 */
+	l.lwz  r14, THRD_FLAGS(r4)
+	l.ori  r15, r0,  (1 << THRD_SYS)
+	l.xori r15, r15, -1
+	l.and  r14, r14, r15
+	l.sw   THRD_FLAGS(r4), r14
+
+	l.lwz r1, THRD_KESP(r4)
+	LOAD_SYMBOL_2_GPR(r14, leave.out)
+	l.jr r14
+	l.nop	
+
+6:
+	l.lwz r1, THRD_KESP(r4)
+7:
 	l.jal tlb_flush
 	l.nop
 
@@ -261,7 +378,26 @@ switch_to:
 	l.bf fork_return
 	l.nop
 
+	/* New thread?. */
+	l.lwz  r15, THRD_FLAGS(r4)
+	l.ori  r17, r0,  (1 << THRD_NEW)
+	l.and  r19, r15, r17
+
+	l.xori r17, r17, -1
+	l.and  r17, r15, r17
+	l.sw   THRD_FLAGS(r4), r17
+
+	l.sfnei r19, 0
+	l.bf pthread_create_return
+	l.nop
+
 	/* Restore stack. */
+	LOAD_SYMBOL_2_GPR(r14, smp_enabled)
+	l.lwz   r14, 0(r14)
+	l.sfnei r14, 0
+	l.bf 8f
+	l.nop
+
 	l.lwz r30, 56(r1)
 	l.lwz r28, 52(r1)
 	l.lwz r26, 48(r1)
@@ -279,10 +415,10 @@ switch_to:
 	l.lwz r29, 0(r1)
 	l.ori r29, r29, ENABLE_MMU
 	l.mtspr r0, r29, SPR_SR
-
 	l.addi r1, r1, 60
-	l.sw PROC_KESP(r3), r15
+	l.sw THRD_KESP(r4), r15
 
+8:
 	/* Processor reload. */
 	l.addi r1, r1, -4
 	l.sw   0(r1), r9
@@ -306,6 +442,26 @@ fork_return:
 	l.jr r15
 	l.nop
 
+/*
+ * Returns from pthread_create.
+ */
+pthread_create_return:
+	/* Decrement interrupt level. */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	l.mfspr r4, r0, SPR_COREID
+	l.slli  r4, r4, PERCORE_SIZE_LOG2
+	l.add   r4, r3, r4
+	l.lwz   r3, PERCORE_CURRTHREAD(r4)
+
+    l.lwz   r4, THRD_INTLVL(r3)
+    l.addi  r4, r4, -1
+    l.sw THRD_INTLVL(r3), r4
+
+	LOAD_SYMBOL_2_GPR(r15, leave.out)
+	l.sw GPR11(r1), r0
+	l.jr r15
+	l.nop
+
 /*----------------------------------------------------------------------------*
  *                                 user_mode()                                *
  *----------------------------------------------------------------------------*/
@@ -314,32 +470,237 @@ fork_return:
  * Switches to user mode.
  */
 user_mode:
+	l.sw   -8(r1), r2
+	l.sw   -4(r1), r9
+	l.addi r2, r1,  0
+	l.addi r1, r1, -8
+
 	/* Enter critical region. */
 	l.jal disable_interrupts
 	l.nop
 
 	/* Set interrupt level to "user level". */
-	LOAD_SYMBOL_2_GPR(r13, curr_proc)
-	l.lwz r13, 0(r13)
-	l.sw PROC_INTLVL(r13), r0
+	LOAD_SYMBOL_2_GPR(r13, cpus)
+	LOAD_SYMBOL_2_GPR(r14, curr_core)
+	l.lwz  r14, 0(r14)
+	l.slli r14, r14, PERCORE_SIZE_LOG2
+	l.add  r14, r13, r14
+	l.lwz  r13, PERCORE_CURRTHREAD(r14)
+	l.ori  r14, r0, 1
+	l.sw   THRD_INTLVL(r13), r14
+
+	/* Reset flags. */
+	l.sw THRD_FLAGS(r13), r0
+
+	/* Retrieves the intstack. */
+	l.lwz r13, THRD_INTSTACK(r13)
 
 	/* Load data. */
 	LOAD_SYMBOL_2_GPR(r15, USER_SR)
-	l.mtspr r0, r15, SPR_ESR_BASE  /* Status register. */
-	l.mtspr r0, r3, SPR_EPCR_BASE  /* Entry point.     */
-	l.or r1, r0, r4                /* Stack.           */
-	l.or r2, r0, r4                /* Frame pointer.   */
+	l.sw ESR(r13), r15   /* Status register. */
+	l.sw EPCR(r13), r3   /* Entry point.     */
+	l.sw SP(r13),   r4   /* Stack.           */
+	l.sw GPR2(r13), r4   /* Frame pointer.   */
 
-	/* Configure argc, argv and envp. */
+	/* Configure argc, argv and envp. */	
 	l.or r15, r4, r0
 	l.lwz r3,  4(r15)  /* argc. */
 	l.lwz r4,  8(r15)  /* argv. */
 	l.lwz r5, 12(r15)  /* argp. */
+	l.sw GPR3(r13), r3
+	l.sw GPR4(r13), r4
+	l.sw GPR5(r13), r5
 
 	/* Clear registers. */
-	CLEAR_ALL_GPR
+	l.sw R0(r13),    r0
+	l.sw GPR6(r13) , r0
+	l.sw GPR7(r13) , r0
+	l.sw GPR8(r13) , r0
+	l.sw GPR9(r13) , r0
+	l.sw GPR10(r13), r0
+	l.sw GPR11(r13), r0
+	l.sw GPR12(r13), r0
+	l.sw GPR13(r13), r0
+	l.sw GPR14(r13), r0
+	l.sw GPR15(r13), r0
+	l.sw GPR16(r13), r0
+	l.sw GPR17(r13), r0
+	l.sw GPR18(r13), r0
+	l.sw GPR19(r13), r0
+	l.sw GPR20(r13), r0
+	l.sw GPR21(r13), r0
+	l.sw GPR22(r13), r0
+	l.sw GPR23(r13), r0
+	l.sw GPR24(r13), r0
+	l.sw GPR25(r13), r0
+	l.sw GPR26(r13), r0
+	l.sw GPR27(r13), r0
+	l.sw GPR28(r13), r0
+	l.sw GPR29(r13), r0
+	l.sw GPR30(r13), r0
+	l.sw GPR31(r13), r0
+	l.sw EEAR(r13),  r0
 
-	l.rfe
+	l.ori r1, r2, 0
+	l.lwz r2, -8(r1)
+	l.lwz r9, -4(r1)
+	l.jr r9
+	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                                  forge_stack()                             *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Forge the expected stack for a new thread.
+ */
+forge_stack:
+
+	/* Adjust kern_sp using kstack page */
+	l.addi r3, r3,  PAGE_SIZE
+	l.addi r3, r3, -DWORD_SIZE
+	l.addi r3, r3, -INT_FRAME_SIZE
+	l.or r11, r3, r0 /* kern_sp pointer will be returned */
+
+	/* General Purpose registers. */
+	l.sw R0(r3)   , r0
+	l.sw SP(r3)   , r5
+	l.sw GPR2(r3) , r5 /* First frame so SP and FP are the same.  */
+	l.sw GPR3(r3) , r4 /* start_thread 1st param : start_routine. */
+	l.sw GPR4(r3) , r6 /* start_thread 2nd param : argument.      */
+	l.sw GPR5(r3) , r0
+	l.sw GPR6(r3) , r0
+	l.sw GPR7(r3) , r0
+	l.sw GPR8(r3) , r0
+	l.sw GPR9(r3) , r0
+	l.sw GPR10(r3), r0
+	l.sw GPR11(r3), r0
+	l.sw GPR12(r3), r0
+	l.sw GPR13(r3), r0
+	l.sw GPR14(r3), r0
+	l.sw GPR15(r3), r0
+	l.sw GPR16(r3), r0
+	l.sw GPR17(r3), r0
+	l.sw GPR18(r3), r0
+	l.sw GPR19(r3), r0
+	l.sw GPR20(r3), r0
+	l.sw GPR21(r3), r0
+	l.sw GPR22(r3), r0
+	l.sw GPR23(r3), r0
+	l.sw GPR24(r3), r0
+	l.sw GPR25(r3), r0
+	l.sw GPR26(r3), r0
+	l.sw GPR27(r3), r0
+	l.sw GPR28(r3), r0
+	l.sw GPR29(r3), r0
+	l.sw GPR30(r3), r0
+	l.sw GPR31(r3), r0
+
+	/* EPCR. */
+	l.sw EPCR(r3), r7 /* start_thread initialization routine. */
+
+	/* EEAR. */
+	l.sw EEAR(r3), r0 /* Not used. */
+
+	/* ESR. */
+	LOAD_SYMBOL_2_GPR(r15, USER_SR)
+	l.sw ESR(r3), r15
+
+	l.jr r9
+	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                              save_ipi_context()                            *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Saves the current context for the master core into the
+ * current thread IPI stack.
+ */
+save_ipi_context:
+	l.sw   -8(r1), r2
+	l.sw   -4(r1), r9
+	l.addi r2, r1,  0
+	l.addi r1, r1, -16
+
+	/* Scratch registers. */
+	l.sw -12(r2), r3
+	l.sw -16(r2), r4
+
+	/* Retrieve the IPI stack. */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	LOAD_SYMBOL_2_GPR(r4, curr_core)
+	l.lwz  r4, 0(r4)
+	l.slli r4, r4, PERCORE_SIZE_LOG2
+	l.add  r4, r3, r4
+	l.lwz  r3, PERCORE_CURRTHREAD(r4)
+	l.lwz  r3, THRD_IPISTACK(r3)
+
+	/* General purpose registers. */
+	l.sw R0(r3)   , r0
+	l.sw SP(r3)   , r1
+	l.sw GPR2(r3) , r2
+	l.sw GPR5(r3) , r5
+	l.sw GPR6(r3) , r6
+	l.sw GPR7(r3) , r7
+	l.sw GPR8(r3) , r8
+	l.sw GPR9(r3) , r9
+	l.sw GPR10(r3), r10
+	l.sw GPR11(r3), r11
+	l.sw GPR12(r3), r12
+	l.sw GPR13(r3), r13
+	l.sw GPR14(r3), r14
+	l.sw GPR15(r3), r15
+	l.sw GPR16(r3), r16
+	l.sw GPR17(r3), r17
+	l.sw GPR18(r3), r18
+	l.sw GPR19(r3), r19
+	l.sw GPR20(r3), r20
+	l.sw GPR21(r3), r21
+	l.sw GPR22(r3), r22
+	l.sw GPR23(r3), r23
+	l.sw GPR24(r3), r24
+	l.sw GPR25(r3), r25
+	l.sw GPR26(r3), r26
+	l.sw GPR27(r3), r27
+	l.sw GPR28(r3), r28
+	l.sw GPR29(r3), r29
+	l.sw GPR30(r3), r30
+	l.sw GPR31(r3), r31
+
+	/* EPCR. */
+	LOAD_SYMBOL_2_GPR(r4, ret_from_ipi_context)
+	l.sw EPCR(r3), r4
+
+	/* EEAR. */
+	l.mfspr r4, r0, SPR_EEAR_BASE
+	l.sw EEAR(r3), r4
+
+	/* ESR. */
+	l.mfspr r4, r0, SPR_ESR_BASE
+	l.sw ESR(r3), r4
+
+	/* Save scratch registers. */
+	l.or  r5, r0, r3
+	l.lwz r3, -12(r2)
+	l.lwz r4, -16(r2)
+	l.sw GPR3(r5), r3
+	l.sw GPR4(r5), r4
+
+	/* Reset curr_core. */
+	LOAD_SYMBOL_2_GPR(r3, curr_core)
+	LOAD_SYMBOL_2_GPR(r4, CORE_MASTER)
+	l.sw 0(r3), r4
+
+	l.j idle_smp
+	l.nop
+
+ret_from_ipi_context:
+	
+	l.ori r1, r2, 0
+	l.lwz r2, -8(r1)
+	l.lwz r9, -4(r1)
+	l.jr r9
 	l.nop
 
 /*----------------------------------------------------------------------------*
@@ -409,5 +770,56 @@ mfspr:
  */
 mtspr:
 	l.mtspr r3, r4, 0
+	l.jr r9
+	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                                   spin_init                                *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Initializes the spin-lock with a given lock.
+ */
+spin_init:
+	l.sw 0(r3), r0
+	l.jr r9
+	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                                   spin_lock                                *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Spin-locks until the lock becomes 0, and so, locks again.
+ * lock = 0, unlocked
+ * lock = 1, locked
+ */
+spin_lock:
+	l.ori   r13, r0, 1
+1:
+	l.lwa   r15, 0(r3)
+	l.sfeqi r15, 0
+	l.bnf   1b
+	l.nop
+	l.swa 0(r3), r13
+	l.bnf   1b
+	l.nop
+
+	l.jr r9
+	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                                  spin_unlock                               *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Unlocks the spin-lock.
+ */
+spin_unlock:
+	l.lwa r13, 0(r3)
+	l.swa 0(r3), r0
+	l.bnf spin_unlock
+	l.nop
+
 	l.jr r9
 	l.nop

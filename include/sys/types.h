@@ -257,6 +257,13 @@ typedef signed char pid_t;
 typedef int pid_t;
 #endif
 
+#if defined(__XMK__)
+typedef signed char tid_t;
+#else
+typedef int tid_t;
+#endif
+
+
 #if defined(__rtems__)
 typedef _mode_t mode_t;
 #endif
@@ -581,6 +588,9 @@ typedef struct {
 #endif  /* !__need_inttypes */
 
 #undef __need_inttypes
+
+/* Used for spinlocks. */
+typedef unsigned spinlock_t; 
 
 #endif  /* _ASM_FILE_   */
 #endif	/* _SYS_TYPES_H */

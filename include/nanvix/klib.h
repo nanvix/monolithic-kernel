@@ -31,7 +31,7 @@
 #define NANVIX_KLIB_H_
 
 	#include <nanvix/const.h>
-	#include <nanvix/pm.h>
+	#include <nanvix/thread.h>
 	#include <sys/types.h>
 	#include <stdarg.h>
 	#include <stdint.h>
@@ -103,7 +103,7 @@
 		unsigned head;                      /**< First character in the buf. */
 		unsigned tail;                      /**< Next free slot in the buf.  */
 		unsigned char buffer[KBUFFER_SIZE]; /**< Ring buffer.                */
-		struct process *chain;              /**< Sleeping chain.             */
+		struct thread *chain;               /**< Sleeping chain.             */
 	};
 	
 	/**
@@ -297,5 +297,21 @@
 	 * @brief No operation.
 	 */
 	#define noop()
+	
+	/**
+	 * Produces an building error if the condition is not met.
+	 */
+	#define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
+
+	/**
+	 * Produces an building error if the condition is not power of two.
+	 */	
+	#define BUILD_BUG_ON_NOT_POWER_OF_2(n)			\
+		BUILD_BUG_ON(!(n) || (((n) & ((n) - 1))))
+
+	/**
+	 * Generic type for a pointer to a void function.
+	 */
+	typedef int (*voidfunction_t)(void); 
 	
 #endif /* NANVIX_KLIB_H_ */

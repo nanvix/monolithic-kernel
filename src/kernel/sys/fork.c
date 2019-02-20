@@ -21,6 +21,7 @@
 #include <nanvix/const.h>
 #include <nanvix/hal.h>
 #include <nanvix/klib.h>
+#include <nanvix/smp.h>
 #include <nanvix/mm.h>
 #include <nanvix/pm.h>
 #include <sys/types.h>
@@ -34,6 +35,8 @@ PUBLIC pid_t sys_fork(void)
 	int i;                /* Loop index.     */
 	int err;              /* Error?          */
 	struct process *proc; /* Process.        */
+	struct thread *thrd;  /* New thread.     */
+	struct thread *t;     /* Tmp thread.     */
 	struct region *reg;   /* Memory region.  */
 	struct pregion *preg; /* Process region. */
 
@@ -54,11 +57,16 @@ PUBLIC pid_t sys_fork(void)
 	}
 
 	kprintf("process table overflow");
-	
+
 	return (-EAGAIN);
 
 found:
+	if ((thrd = get_free_thread()) == NULL)
+		return (-EAGAIN);
 	
+	thrd->state = THRD_READY;
+	proc->threads = thrd;
+
 	/* Mark process as beeing created. */
 	proc->flags = 1 << PROC_NEW;
 
@@ -104,17 +112,58 @@ found:
 			
 		unlockreg(reg);
 	}
+
+	/* Duplicate attached thread region.
+	 * There will be only one thread in
+	 * the son process according to POSIX */
+	preg = &cpus[curr_core].curr_thread->pregs;
+
+	/* Thread region not in use. */
+	if (preg->reg == NULL)
+		goto dup_done;
+
+	lockreg(preg->reg);
+	reg = dupreg(preg->reg);
+	unlockreg(preg->reg);
+
+	/* Failed to duplicate region. */
+	if (reg == NULL)
+		goto error1;
+
+	err = attachreg(proc, &proc->threads->pregs, preg->start, reg);
+
+	/* Failed to attach region. */
+	if (err)
+	{
+		/*
+		 * FIXME: region count.
+		 */
+		kpanic("failed to attach thread region");
+		freereg(reg);
+		goto error1;
+	}
+
+	unlockreg(reg);
+dup_done:
 	
 	/* Initialize process. */
-	proc->intlvl = 1;
+	proc->threads->intlvl = 1;
 	proc->received = 0;
 	proc->restorer = curr_proc->restorer;
-	kmemcpy(&proc->fss, &curr_proc->fss, sizeof(struct fpu));
+	proc->threads->tid = next_tid++;
+	proc->threads->next = NULL;
+	proc->threads->retval = NULL;
+	proc->threads->flags = 0 << THRD_NEW;
+	proc->threads->next_thrd = NULL;
+	proc->threads->chain = NULL;
+	proc->threads->father = proc;
+
+	kmemcpy(&proc->threads->fss, &cpus[curr_core].curr_thread->fss, sizeof(struct fpu));
+
 	for (i = 0; i < NR_SIGNALS; i++)
 		proc->handlers[i] = curr_proc->handlers[i];
-	proc->irqlvl = curr_proc->irqlvl;
-	proc->pmcs.enable_counters = 0;
-	proc->size = curr_proc->size;
+	proc->threads->irqlvl = cpus[curr_core].curr_thread->irqlvl;
+	proc->threads->pmcs.enable_counters = 0;
 	proc->pwd = curr_proc->pwd;
 	proc->pwd->count++;
 	proc->root = curr_proc->root;
@@ -146,12 +195,24 @@ found:
 	proc->ktime = 0;
 	proc->cutime = 0;
 	proc->cktime = 0;
-	proc->priority = curr_proc->priority;
+	proc->threads->priority = cpus[curr_core].curr_thread->priority;
 	proc->nice = curr_proc->nice;
 	proc->alarm = 0;
 	proc->next = NULL;
 	proc->chain = NULL;
-	sched(proc);
+	proc->size = curr_proc->size;
+	t = curr_proc->threads;
+	while (t != NULL)
+	{
+		/* New proc can be smaller than current proc. */
+		if (t != cpus[curr_core].curr_thread)
+			proc->size -= t->pregs.reg->size;
+		t = t->next;
+	}
+
+
+
+	sched(proc->threads);
 
 	curr_proc->nchildren++;
 	

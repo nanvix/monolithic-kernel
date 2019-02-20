@@ -27,6 +27,7 @@
 #include <nanvix/mm.h>
 #include <nanvix/pm.h>
 #include <nanvix/klib.h>
+#include <nanvix/thread.h>
 #include <sys/stat.h>
 #include <signal.h>
 #include <limits.h>
@@ -72,8 +73,8 @@ PUBLIC unsigned nprocs = 0;
 /* semtable init */
 PUBLIC struct ksem semtable[SEM_OPEN_MAX];
 
-/* Processes waiting for a semaphore */
-PUBLIC struct process* semwaiters[PROC_MAX];
+/* Threads waiting for a semaphore */
+PUBLIC struct thread *semwaiters[THRD_MAX];
 
 PUBLIC struct ksem sembuf;
 
@@ -85,27 +86,44 @@ PUBLIC struct inode *semdirectory;
 PUBLIC void pm_init(void)
 {	
 	struct process *p;
-	
+	struct thread *t;
+
+	/* Initialize the thread table. */
+	for (t = FIRST_THRD; t <= LAST_THRD; t++)
+		t->state = THRD_DEAD;
+
 	/* Initialize the process table. */
 	for (p = FIRST_PROC; p <= LAST_PROC; p++)
 		p->flags = 0, p->state = PROC_DEAD;
 	
 	kprintf("pm: handcrafting idle process");
+
+	IDLE->threads = THRD_IDLE;
+	IDLE->threads->state = THRD_READY;
+	IDLE->threads->next = NULL;
+	IDLE->threads->flags = 0 << THRD_NEW;
 		
 	/* Handcraft init process. */
 	IDLE->cr3 = (dword_t)idle_pgdir;
-	IDLE->intlvl = 1;
+	IDLE->threads->intlvl = 1;
 	IDLE->flags = 0;
 	IDLE->received = 0;
-	IDLE->kstack = idle_kstack;
+	IDLE->threads->kstack = idle_kstack;
+	IDLE->threads->tid = next_tid++;
+	IDLE->threads->counter = PROC_QUANTUM;
+	IDLE->threads->next_thrd = NULL;
+	IDLE->threads->chain = NULL;
+	IDLE->threads->father = IDLE;
+	IDLE->counter = 0;
 	IDLE->restorer = NULL;
 	for (int i = 0; i < NR_SIGNALS; i++)
 		IDLE->handlers[i] = SIG_DFL;
-	IDLE->irqlvl = INT_LVL_5;
-	IDLE->pmcs.enable_counters = 0;
+	IDLE->threads->irqlvl = INT_LVL_5;
+	IDLE->threads->pmcs.enable_counters = 0;
 	IDLE->pgdir = idle_pgdir;
 	for (int i = 0; i < NR_PREGIONS; i++)
 		IDLE->pregs[i].reg = NULL;
+	IDLE->threads->pregs.reg = NULL;
 	IDLE->size = 0;
 	for (int i = 0; i < OPEN_MAX; i++)
 		IDLE->ofiles[i] = NULL;
@@ -129,13 +147,12 @@ PUBLIC void pm_init(void)
 	IDLE->cutime = 0;
 	IDLE->cktime = 0;
 	IDLE->state = PROC_RUNNING;
-	IDLE->counter = PROC_QUANTUM;
-	IDLE->priority = PRIO_USER;
 	IDLE->nice = NZERO;
 	IDLE->alarm = 0;
 	IDLE->next = NULL;
 	IDLE->chain = NULL;
-	
+
+
 	nprocs++;
 
 	/* Initializing semaphore table */
@@ -147,6 +164,7 @@ PUBLIC void pm_init(void)
 			semtable[i].currprocs[j] = (-1);
 	}
 
-
+	thread_init();	
+	
 	enable_interrupts();
 }

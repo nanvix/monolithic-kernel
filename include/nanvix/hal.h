@@ -38,11 +38,11 @@
 #endif	
 
 	#include <nanvix/const.h>
-	#include <nanvix/pm.h>
 	#include <stdlib.h>
 	
 	/* Forward definitions. */
 	struct process;
+	struct thread;
 	
 	/**
 	 * @name Interrupt Priority Levels
@@ -61,6 +61,7 @@
 	 */
 	/**@{*/
 	EXTERN int set_hwint(int, void (*)(void));
+	EXTERN void setup_interrupts(void);
 	EXTERN void enable_interrupts(void);
 	EXTERN void disable_interrupts(void);
 	EXTERN void halt(void);
@@ -69,7 +70,13 @@
 	EXTERN void processor_reload(void);
 	EXTERN void setup(void);
 	EXTERN void user_mode(addr_t, addr_t);
-	EXTERN void switch_to(struct process *);
+	EXTERN void switch_to(struct process *, struct thread *);
+	EXTERN addr_t forge_stack(void * kstack,
+		   void *(*start_routine)( void * ),
+							 addr_t user_sp,
+								 void * arg,
+		  void (*__start_thread)( void * ));
+
 	EXTERN unsigned irq_lvl(unsigned);
 	/**@}*/	
 	

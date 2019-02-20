@@ -40,6 +40,8 @@
 
 #include <nanvix/mm.h>
 #include <nanvix/syscall.h>
+#include <nanvix/pm.h>
+#include <nanvix/smp.h>
 #include <or1k/or1k.h>
 #include <or1k/asm_defs.h>
 #include <or1k/int.h>
@@ -82,6 +84,7 @@
 .globl hwint14
 .globl hwint15
 .globl leave
+.globl leave.out
 .globl do_hwint
 
 .globl dtlb_miss_handler
@@ -90,192 +93,14 @@
 .section .exception
 
 /*----------------------------------------------------------------------------*
- *                                exception_enter                             *
- *----------------------------------------------------------------------------*/
-.macro exception_enter
-	EXCEPTION_STORE_GPR3
-	EXCEPTION_STORE_GPR5
-		
-	/* Checks if we are in user or kernel mode. */
-	LOAD_SYMBOL_2_GPR(r5, KBASE_VIRT)
-	EXCEPTION_T_STORE_GPR30           /* Backup register.          */
-	l.mfspr r30, r0,  SPR_ESR_BASE
-	l.andi  r30, r30, SPR_SR_SM
-	l.sfeqi r30, 0
-	l.bnf   2f
-	EXCEPTION_T_STORE_SP              /* Delay slot, save SP (r1). */
-	
-	/* Extracts the Kernel stack. */
-
-	/* User mode. */
-1:
-	LOAD_SYMBOL_2_GPR(r3, curr_proc)
-	l.sub r3, r3, r5
-	l.lwz r3, 0(r3)
-	l.sub r3, r3, r5
-	l.lwz r1, PROC_KESP(r3)
-
-	/* Kernel mode. */
-2:
-	/* Create new stack frame. */
-	l.addi r1, r1, -(INT_FRAME_SIZE)
-	l.sub  r1, r1, r5
-
-	/* Save registers. */
-	EXCEPTION_LOAD_GPR3
-	EXCEPTION_LOAD_GPR5
-	EXCEPTION_STORE_GPR9 /* Backup Link Register before the jal. */
-	l.jal save
-	l.nop
-	EXCEPTION_LOAD_GPR9
-	l.sw GPR9(r1), r9
-
-	/* Enter. */
-	l.jal enter
-	l.nop
-
-	/* Enable MMU. */
-	l.mfspr r30, r0,  SPR_SR
-	l.ori   r30, r30, (ENABLE_MMU | SPR_SR_SM)
-	l.mtspr r0,  r30, SPR_SR
-
-	/* Virtual address. */
-	l.add r1, r1, r5
-.endm
-
-/*----------------------------------------------------------------------------*
- *                                   swint()                                  *
- *----------------------------------------------------------------------------*/
-
-/* Software interrupts */
-.macro swint_handler, number, handler
-	swint\number:
-		exception_enter
-
-		LOAD_SYMBOL_2_GPR(r5, enable_interrupts)
-		l.jalr r5
-		l.nop
-
-		/* Check if syscall. */
-		l.ori   r3, r0, \number
-		l.sfeqi r3, 9
-		l.bnf 3f
-		l.nop
-
-		/* Syscall. */
-		l.j syscall
-		l.nop
-
-	3:
-		/* Not syscall, lets do swint. */
-		l.or   r4, r1, r0
-		LOAD_SYMBOL_2_GPR(r5, \handler)
-		l.jalr r5
-		l.nop
-
-		/* Enter critical region. */
-		LOAD_SYMBOL_2_GPR(r5, disable_interrupts)
-		l.jalr r5
-		l.nop
-
-		/* Return from exception. */
-	4:
-		l.j leave
-		l.nop
-.endm
-
-/*----------------------------------------------------------------------------*
- *                                   hwint()                                  *
- *----------------------------------------------------------------------------*/
-
-/* Hardware interrupts */
-.macro hwint_handler, number
-	hwint\number:
-		exception_enter
-
-		/* hwint. */
-		l.ori  r3, r0, \number
-		LOAD_SYMBOL_2_GPR(r5, do_hwint)
-		l.jalr r5
-		l.nop
-
-		/* Return from exception. */
-		l.j leave
-		l.nop
-.endm
-
-/*----------------------------------------------------------------------------*
- *                                  exceptions                                *
- *----------------------------------------------------------------------------*/
-
-.org 0x100
-reset_exception:
-	swint_handler 0 do_reset
-
-.org 0x200
-bus_exception:
-	swint_handler 1 do_bus_error
-
-.org 0x300
-data_page_fault_exception:
-	swint_handler 2 _do_page_pfault
-
-.org 0x400
-instruction_page_fault:
-	swint_handler 3 _do_page_pfault
-
-.org 0x500
-tick_timer_exception:
-	hwint_handler INT_CLOCK
-
-.org 0x600
-alignment_exception:
-	swint_handler 5 do_alignment
-
-.org 0x700
-illegal_instruction_exception:
-	swint_handler 6 do_illegal_instruction
-
-.org 0x800
-external_interrupt_exception:
-	hwint_handler INT_EXTERNAL
-
-.org 0x900
-dtlb_miss_exception:
-	l.j	boot_dtlb_miss_handler
-	l.nop
-
-.org 0xa00
-itlb_miss_exception:
-	l.j	boot_itlb_miss_handler
-	l.nop
-
-.org 0xb00
-range_exception:
-	swint_handler 8 do_range
-
-.org 0xc00
-syscall_exception:
-	swint_handler 9 0
-
-.org 0xd00
-floating_point_exception:
-	swint_handler 10 do_float
-
-.org 0xe00
-trap_exception:
-	swint_handler 11 do_trap
-
-.align PAGE_SIZE
-/*----------------------------------------------------------------------------*
  *                                  save()                                    *
  *----------------------------------------------------------------------------*/
 
 /*
  * Saves registers.
  */
-save:
-	/* General Purpose registers, except r30 and r9. */
+.macro save
+	/* General Purpose registers, except r30. */
 	l.sw GPR2(r1) , r2
 	l.sw GPR3(r1) , r3
 	l.sw GPR4(r1) , r4
@@ -283,6 +108,7 @@ save:
 	l.sw GPR6(r1) , r6
 	l.sw GPR7(r1) , r7
 	l.sw GPR8(r1) , r8
+	l.sw GPR9(r1) , r9
 	l.sw GPR10(r1), r10
 	l.sw GPR11(r1), r11
 	l.sw GPR12(r1), r12
@@ -325,8 +151,7 @@ save:
 	EXCEPTION_T_LOAD_GPR30(r30)
 	l.sw GPR30(r1), r30
 
-	l.jr r9
-	l.nop
+.endm
 
 /*----------------------------------------------------------------------------*
  *                                 enter()                                    *
@@ -335,29 +160,428 @@ save:
 /*
  * Enters in kernel.
  */
-enter:
-	LOAD_SYMBOL_2_GPR(r3, curr_proc)
+.macro enter
+	LOAD_SYMBOL_2_GPR(r3, cpus)
 	LOAD_SYMBOL_2_GPR(r5, KBASE_VIRT)
 
 	/* Increment interrupt level. */
-	l.sub r3, r3, r5
-	l.lwz r3, 0(r3)
-	l.sub r3, r3, r5 
+	l.mfspr r7, r0, SPR_COREID
+	l.slli  r7, r7, PERCORE_SIZE_LOG2
+	l.add   r7, r3, r7
+	l.sub   r7, r7, r5
+	l.lwz   r3, PERCORE_CURRTHREAD(r7)
+	l.sub   r3, r3, r5
 
-	l.lwz  r7, PROC_INTLVL(r3)
+	l.lwz  r7, THRD_INTLVL(r3)
 	l.addi r7, r7, 1
-	l.sw   PROC_INTLVL(r3), r7
+	l.sw   THRD_INTLVL(r3), r7
     
 	/* Save interrupt stack. */
-	l.lwz r7,   PROC_KESP(r3)
+	l.lwz r7, THRD_KESP(r3)
 	l.sw 0(r1), r7
 
 	l.or  r6, r0, r1
 	l.add r6, r5, r6
-	l.sw PROC_KESP(r3), r6
+	l.sw THRD_KESP(r3), r6
 
-	l.jr r9
+.endm
+
+/*----------------------------------------------------------------------------*
+ *                                exception_enter                             *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Restores the appropriate stack, save registers
+ * and enable MMU.
+ */
+.macro exception_enter
+	EXCEPTION_STORE_GPR3
+	EXCEPTION_STORE_GPR5
+
+	/* Checks if we are in user or kernel mode. */
+	LOAD_SYMBOL_2_GPR(r5, KBASE_VIRT)
+	EXCEPTION_T_STORE_GPR30           /* Backup register.          */
+	l.mfspr r30, r0,  SPR_ESR_BASE
+	l.andi  r30, r30, SPR_SR_SM
+	l.sfeqi r30, 0
+	l.bnf   3f
+	EXCEPTION_T_STORE_SP              /* Delay slot, save SP (r1). */
+	
+	/* Extracts the Kernel stack. */
+
+	/* User mode. */
+	LOAD_SYMBOL_2_GPR(r3,  cpus)
+	l.mfspr r30, r0,  SPR_COREID
+	l.slli  r30, r30, PERCORE_SIZE_LOG2
+	l.add   r30, r3, r30
+	l.sub   r30, r30, r5
+
+	l.lwz r3, PERCORE_CURRTHREAD(r30)
+	l.sub r3, r3, r5
+	l.lwz r1, THRD_KESP(r3)
+
+	/* Kernel mode. */
+3:
+	/* Create new stack frame. */
+	l.addi r1, r1, -(INT_FRAME_SIZE)
+	l.sub  r1, r1, r5
+
+	/* Save registers. */
+	EXCEPTION_LOAD_GPR3
+	EXCEPTION_LOAD_GPR5
+	save
+
+	/* Enter. */
+	enter
+
+	/* Enable MMU. */
+	l.mfspr r30, r0,  SPR_SR
+	l.ori   r30, r30, (ENABLE_MMU | SPR_SR_SM)
+	l.mtspr r0,  r30, SPR_SR
+
+	/* Virtual address. */
+	l.add r1, r1, r5
+
+	/* Save intstack. */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	l.mfspr r5, r0, SPR_COREID
+	l.slli  r5, r5, PERCORE_SIZE_LOG2
+	l.add   r5, r3, r5
+	l.lwz   r3, PERCORE_CURRTHREAD(r5)
+	l.sw THRD_INTSTACK(r3), r1
+.endm
+
+/*----------------------------------------------------------------------------*
+ *                                   swint()                                  *
+ *----------------------------------------------------------------------------*/
+
+/* Software interrupts */
+.macro swint_handler, number, handler
+	swint\number:
+		exception_enter
+
+		l.ori r3, r0, (1 << INT_OMPIC)
+		LOAD_SYMBOL_2_GPR(r5, pic_mask)
+		l.jalr r5
+		l.nop
+
+		LOAD_SYMBOL_2_GPR(r5, enable_interrupts)
+		l.jalr r5
+		l.nop
+
+		/* Check if syscall. */
+		l.ori   r3, r0, \number
+		l.sfeqi r3, 9
+		l.bnf 7f
+		l.nop
+
+		/* Syscall. */
+
+		/* Let us check if SMP. */
+		l.mfspr r3, r0, SPR_COREID
+		l.sfeqi r3, 0
+		l.bf 6f
+		l.nop
+
+		/* SMP. */
+		l.ori r3, r0, 0
+		l.ori r4, r0, IPI_SYSCALL
+		LOAD_SYMBOL_2_GPR(r5, ompic_send_ipi)
+		l.jalr r5
+		l.nop
+
+		/* Waits for master. */
+	4:
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r5, r4, PERCORE_SIZE_LOG2
+		l.add   r5, r3, r5
+		l.lwz   r3, PERCORE_IPIMESSAGE(r5)
+		l.sfeqi r3, 0
+		l.bf 5f
+		l.nop
+
+		LOAD_SYMBOL_2_GPR(r5, ompic_handle_ipi)
+		l.jalr r5
+		l.nop
+
+	5:
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r5, r4, PERCORE_SIZE_LOG2
+		l.add   r5, r3, r5
+		l.lwz   r3, PERCORE_CURRTHREAD(r5)
+		l.lwz   r5, THRD_IPIDATA + IPIDATA_RELEASEIPI(r3)
+		
+		l.sfeq r4, r5
+		l.bnf  4b
+		l.nop
+
+		/* Reset release_ipi. */
+		l.sw THRD_IPIDATA + IPIDATA_RELEASEIPI(r3), r0
+
+		l.j 11f
+		l.nop
+
+	6:
+		/* UP. */
+		l.j syscall
+		l.nop
+
+	7:
+		/* Not syscall, lets do exception. */
+
+		/* Let us check if SMP. */
+		l.mfspr r3, r0, SPR_COREID
+		l.sfeqi r3, 0
+		l.bf 10f
+		l.nop
+
+		/* SMP. */
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r5, r4, PERCORE_SIZE_LOG2
+		l.add   r5, r3, r5
+		l.lwz   r3, PERCORE_CURRTHREAD(r5)
+		l.addi  r3, r3, THRD_IPIDATA + IPIDATA_HANDLER
+		LOAD_SYMBOL_2_GPR(r4, \handler)
+		l.sw 0(r3), r4
+
+		l.ori r3, r0, 0
+		l.ori r4, r0, IPI_EXCEPTION
+		LOAD_SYMBOL_2_GPR(r5, ompic_send_ipi)
+		l.jalr r5
+		l.nop
+
+		/* Waits for master. */
+	8:
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r5, r4, PERCORE_SIZE_LOG2
+		l.add   r5, r3, r5
+		l.lwz   r3, PERCORE_IPIMESSAGE(r5)
+		l.sfeqi r3, 0
+		l.bf 9f
+		l.nop
+
+		LOAD_SYMBOL_2_GPR(r5, ompic_handle_ipi)
+		l.jalr r5
+		l.nop
+
+	9:
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r5, r4, PERCORE_SIZE_LOG2
+		l.add   r5, r3, r5
+		l.lwz   r3, PERCORE_CURRTHREAD(r5)
+		l.lwz   r5, THRD_IPIDATA + IPIDATA_RELEASEIPI(r3)
+		
+		l.sfeq r4, r5
+		l.bnf  8b
+		l.nop
+
+		/* Reset release_ipi. */
+		l.sw THRD_IPIDATA + IPIDATA_RELEASEIPI(r3), r0
+
+		l.j 11f
+		l.nop
+
+	10:
+		l.or   r4, r1, r0
+		LOAD_SYMBOL_2_GPR(r5, \handler)
+		l.jalr r5
+		l.nop
+
+	11:
+		/* Checks if TLB flush is needed. */
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r4, r4, PERCORE_SIZE_LOG2
+		l.add   r4, r3, r4
+		l.lwz   r3, PERCORE_CURRTHREAD(r4)
+		l.lwz   r4, THRD_TLBFLUSH(r3)
+
+		l.sfeq r4, r0
+		l.bf 12f
+		l.nop
+		LOAD_SYMBOL_2_GPR(r5, tlb_flush)
+		l.jalr r5
+		l.nop
+
+		/* Reset 'tlb_flush' field. */
+		l.sw THRD_TLBFLUSH(r3), r0
+
+	12:
+		/* Enter critical region. */
+		LOAD_SYMBOL_2_GPR(r5, disable_interrupts)
+		l.jalr r5
+		l.nop
+
+		/* Return from exception. */
+	12:
+		l.j leave
+		l.nop
+.endm
+
+/*----------------------------------------------------------------------------*
+ *                                   hwint()                                  *
+ *----------------------------------------------------------------------------*/
+
+/* Hardware interrupts */
+.macro hwint_handler, number
+	hwint\number:
+		exception_enter
+
+		/* hwint. */
+		l.ori  r3, r0, \number
+		LOAD_SYMBOL_2_GPR(r5, do_hwint)
+		l.jalr r5
+		l.nop
+
+		/* Return from exception. */
+		l.j leave
+		l.nop
+.endm
+
+/*----------------------------------------------------------------------------*
+ *                                  exceptions                                *
+ *----------------------------------------------------------------------------*/
+
+.org 0x100
+	l.j reset_exception
 	l.nop
+
+.org 0x200
+	l.j bus_exception
+	l.nop
+
+.org 0x300
+	l.j data_page_fault_exception
+	l.nop
+
+.org 0x400
+	l.j instruction_page_fault
+	l.nop
+
+.org 0x500
+	l.j tick_timer_exception
+	l.nop
+
+.org 0x600
+	l.j alignment_exception
+	l.nop
+
+.org 0x700
+	l.j illegal_instruction_exception
+	l.nop
+
+.org 0x800
+	l.j external_interrupt_exception
+	l.nop
+
+.org 0x900
+	l.j	boot_dtlb_miss_handler
+	l.nop
+
+.org 0xa00
+	l.j	boot_itlb_miss_handler
+	l.nop
+
+.org 0xb00
+	l.j range_exception
+	l.nop
+
+.org 0xc00
+	l.j syscall_exception
+	l.nop
+
+.org 0xd00
+	l.j floating_point_exception
+	l.nop
+
+.org 0xe00
+	l.j trap_exception
+	l.nop
+
+.align PAGE_SIZE
+/*----------------------------------------------------------------------------*
+ *                              reset_exception()                             *
+ *----------------------------------------------------------------------------*/
+reset_exception:
+	l.or r1, r0, r0
+	l.or r2, r0, r0
+	l.or r3, r0, r0
+	l.or r4, r0, r0
+	l.or r5, r0, r0
+	CLEAR_ALL_GPR
+	l.j start
+	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                                bus_exception()                             *
+ *----------------------------------------------------------------------------*/
+bus_exception:
+	swint_handler 1 do_bus_error
+
+/*----------------------------------------------------------------------------*
+ *                         data_page_fault_exception()                        *
+ *----------------------------------------------------------------------------*/
+data_page_fault_exception:
+	swint_handler 2 _do_page_pfault + KBASE_VIRT
+
+/*----------------------------------------------------------------------------*
+ *                           instruction_page_fault()                         *
+ *----------------------------------------------------------------------------*/
+instruction_page_fault:
+	swint_handler 3 _do_page_pfault + KBASE_VIRT
+
+/*----------------------------------------------------------------------------*
+ *                            tick_timer_exception()                          *
+ *----------------------------------------------------------------------------*/
+tick_timer_exception:
+	hwint_handler INT_CLOCK
+
+/*----------------------------------------------------------------------------*
+ *                             alignment_exception()                          *
+ *----------------------------------------------------------------------------*/
+alignment_exception:
+	swint_handler 5 do_alignment
+
+/*----------------------------------------------------------------------------*
+ *                       illegal_instruction_exception()                      *
+ *----------------------------------------------------------------------------*/
+illegal_instruction_exception:
+	swint_handler 6 do_illegal_instruction
+
+/*----------------------------------------------------------------------------*
+ *                        external_interrupt_exception()                      *
+ *----------------------------------------------------------------------------*/
+external_interrupt_exception:
+	hwint_handler INT_EXTERNAL
+
+/*----------------------------------------------------------------------------*
+ *                               range_exception()                            *
+ *----------------------------------------------------------------------------*/
+range_exception:
+	swint_handler 8 do_range
+
+/*----------------------------------------------------------------------------*
+ *                              syscall_exception()                           *
+ *----------------------------------------------------------------------------*/
+syscall_exception:
+	swint_handler 9 0
+
+/*----------------------------------------------------------------------------*
+ *                           floating_point_exception()                       *
+ *----------------------------------------------------------------------------*/
+floating_point_exception:
+	swint_handler 10 do_float
+
+/*----------------------------------------------------------------------------*
+ *                                trap_exception()                            *
+ *----------------------------------------------------------------------------*/
+trap_exception:
+	swint_handler 11 do_trap
 
 /*----------------------------------------------------------------------------*
  *                                leave()                                     *
@@ -367,28 +591,32 @@ enter:
  * Leaves kernel.
  */
 leave:
-	LOAD_SYMBOL_2_GPR(r3, curr_proc)
-	l.lwz r3, 0(r3)
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	l.mfspr r4, r0, SPR_COREID
+	l.slli  r4, r4, PERCORE_SIZE_LOG2
+	l.add   r4, r3, r4
+	l.lwz   r3, PERCORE_CURRTHREAD(r4)
 
 	/* Restore interrupt stack. */
 	l.lwz  r4, 0(r1)
-	l.sw PROC_KESP(r3), r4
+	l.sw THRD_KESP(r3), r4
+	l.sw THRD_INTSTACK(r3), r4
 
 	/* Decrement interrupt level. */
-	l.lwz   r4, PROC_INTLVL(r3)
+	l.lwz   r4, THRD_INTLVL(r3)
 	l.addi  r4, r4, -1
-	l.sw PROC_INTLVL(r3), r4
+	l.sw THRD_INTLVL(r3), r4
 	l.sfnei r4, 0
 	l.bf leave.out
 	l.nop
 
 	/* Check if we were handling a system call. */
-	l.lwz  r15, PROC_FLAGS(r3)
-	l.ori  r17, r0,  (1 << PROC_SYS)
+	l.lwz  r15, THRD_FLAGS(r3)
+	l.ori  r17, r0,  (1 << THRD_SYS)
 	l.and  r19, r15, r17
 	l.xori r17, r17, -1
 	l.and  r17, r15, r17
-	l.sw   PROC_FLAGS(r3), r17
+	l.sw   THRD_FLAGS(r3), r17
 	l.sfnei r19, 0
 	l.bnf check_signals
 	l.nop
@@ -398,7 +626,13 @@ leave:
 	 * So, let us be nice with other processes
 	 * and give them a chance to run.
 	 */
+	l.mfspr r15, r0, SPR_COREID
+	l.sfnei r15, CORE_MASTER
+	l.bf leave.out
+	l.nop
+
 	LOAD_SYMBOL_2_GPR(r15, yield)
+	l.lwz  r15, 0(r15)
 	l.jalr r15
 	l.nop
 
@@ -451,17 +685,7 @@ leave.out:
 	l.ori   r30, r30, (ENABLE_MMU)
 	l.mtspr r0,  r30, SPR_ESR_BASE
 
-	/* Let us check if we have to enable TTMR_IE. */
-	l.andi  r30, r30, (SPR_SR_IEE|SPR_SR_TEE)
-	l.sfnei r30, (SPR_SR_IEE|SPR_SR_TEE)
-	l.bf 1f
-	l.nop
 
-	l.mfspr r30, r0, SPR_TTMR
-	LOAD_SYMBOL_2_GPR(r31, SPR_TTMR_IE)
-	l.or    r30, r30, r31
-	l.mtspr r0, r30, SPR_TTMR
-1:
 	/* r30. */
 	l.lwz r30, GPR30(r1)
 
@@ -481,20 +705,36 @@ leave.out:
  * System call hook.
  */
 syscall:
+	l.sw   -8(r1), r2
+	l.sw   -4(r1), r9
+	l.addi r2, r1,  0
+	l.addi r1, r1, -8
+
 	/* Set 'handling system call' flag. */
-	LOAD_SYMBOL_2_GPR(r3, curr_proc)
-	l.lwz r3, 0(r3)
-	l.lwz r5, PROC_FLAGS(r3)
-	l.ori r5, r5, (1 << PROC_SYS)
-	l.sw  PROC_FLAGS(r3), r5
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	LOAD_SYMBOL_2_GPR(r4, curr_core)
+	l.lwz  r4, 0(r4)
+	l.slli r4, r4, PERCORE_SIZE_LOG2
+	l.add  r4, r3, r4
+	l.lwz  r3, PERCORE_CURRTHREAD(r4)
+
+	l.lwz r5, THRD_FLAGS(r3)
+	l.ori r5, r5, (1 << THRD_SYS)
+	l.sw  THRD_FLAGS(r3), r5
+
+	/* Get intstack. */
+	l.lwz  r13, THRD_INTSTACK(r3)
+
+	/* Save intstack into sys intstack pointer. */
+	l.sw THRD_SYSSTACK(r3), r13
 
 	/* Get system call parameters. */
-	l.lwz r3,  GPR3(r1)
-	l.lwz r4,  GPR4(r1)
-	l.lwz r5,  GPR5(r1)
-	l.lwz r6,  GPR6(r1)
-	l.lwz r7,  GPR7(r1)
-	l.lwz r11, GPR11(r1) /* syscall number. */
+	l.lwz r3,  GPR3(r13)
+	l.lwz r4,  GPR4(r13)
+	l.lwz r5,  GPR5(r13)
+	l.lwz r6,  GPR6(r13)
+	l.lwz r7,  GPR7(r13)
+	l.lwz r11, GPR11(r13) /* syscall number. */
 	
 	/* Check for bad system call. */
 	l.sfltui r11, NR_SYSCALLS
@@ -518,15 +758,46 @@ syscall:
 		l.nop
 
 	bad_syscall:
+		/* Get intstack. */
+		LOAD_SYMBOL_2_GPR(r13, cpus)
+		LOAD_SYMBOL_2_GPR(r14, curr_core)
+		l.lwz  r14, 0(r14)
+		l.slli r15, r14, PERCORE_SIZE_LOG2
+		l.add  r15, r13, r15
+		l.lwz  r13, PERCORE_NEXTTHREAD(r15)
+		l.lwz  r13, THRD_SYSSTACK(r13)
+		
 		/* Copy return value to user stack. */
-		l.sw GPR11(r1), r11
+		l.sw GPR11(r13), r11
+
+		/*
+		 * Checks if we are serving another core, if so, skip
+		 * leave() and disable_interrupts() function.
+		 */
+		l.sfnei r14, 0
+		l.bf return_ipi
+		l.nop
 
 		/* Enter critical region. */
 		LOAD_SYMBOL_2_GPR(r5, disable_interrupts)
 		l.jalr r5
 		l.nop
 
+		/* Recover the stack pointer. */
+		l.ori r1, r2, 0
+		l.lwz r2, -8(r1)
+		l.lwz r9, -4(r1)
+
+		/* Leave. */
 		l.j leave
+		l.nop
+	
+		/* Return from IPI. */
+	return_ipi:
+		l.ori r1, r2, 0
+		l.lwz r2, -8(r1)
+		l.lwz r9, -4(r1)
+		l.jr r9
 		l.nop
 
 /*
@@ -538,11 +809,44 @@ _do_page_pfault:
 	l.addi r2, r1,  0
 	l.addi r1, r1, -8
 
-	l.lwz r3, EEAR(r4) /* addr.     */
-	l.or  r7, r4, r0   /* intstack. */
-	l.ori r4, r0, 2    /* err.      */
-	l.ori r5, r0, 0    /* dummy0.   */
-	l.ori r6, r0, 0    /* dummy1.   */
+	/**
+	 * Checks if are serving an exception triggered
+	 * from core master, or if it's the master serving
+	 * a slave IPI.
+	 */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	LOAD_SYMBOL_2_GPR(r4, curr_core)
+	l.lwz   r4, 0(r4)
+	l.slli  r4, r4, PERCORE_SIZE_LOG2
+	l.add   r4, r3, r4
+	l.lwz   r3, PERCORE_CURRTHREAD(r4)
+	l.lwz   r3, THRD_IPIDATA + IPIDATA_HANDLER(r3)
+
+	LOAD_SYMBOL_2_GPR(r5, KBASE_VIRT)
+	l.sub r3, r3, r5
+	LOAD_SYMBOL_2_GPR(r5, _do_page_pfault)
+	l.sfeq r3, r5
+	l.bf 1f
+	l.nop
+
+	/* If not pfault. */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	l.ori  r4, r0, CORE_MASTER
+	l.slli r4, r4, PERCORE_SIZE_LOG2
+	l.add  r4, r3, r4
+	l.lwz  r3, PERCORE_CURRTHREAD(r4)
+	l.j 2f
+	l.nop
+
+	/* If pfault. */
+1:
+	l.lwz  r3, PERCORE_CURRTHREAD(r4)
+2:
+	l.lwz  r7, THRD_INTSTACK(r3) /* intstack. */
+	l.lwz  r3, EEAR(r7)          /* addr.     */
+	l.ori r4, r0, 2              /* err.      */
+	l.ori r5, r0, 0              /* dummy0.   */
+	l.ori r6, r0, 0              /* dummy1.   */
 
 	LOAD_SYMBOL_2_GPR(r13, do_page_fault)
 	l.jalr r13
@@ -563,11 +867,44 @@ _do_page_vfault:
 	l.addi r2, r1,  0
 	l.addi r1, r1, -8
 
-	l.lwz r3, EEAR(r4) /* addr.     */
-	l.or  r7, r4, r0   /* intstack. */
-	l.ori r4, r0, 0    /* err.      */
-	l.ori r5, r0, 0    /* dummy0.   */
-	l.ori r6, r0, 0    /* dummy1.   */
+	/**
+	 * Checks if are serving an exception triggered
+	 * from core master, or if it's the master serving
+	 * a slave IPI.
+	 */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	LOAD_SYMBOL_2_GPR(r4, curr_core)
+	l.lwz   r4, 0(r4)
+	l.slli  r4, r4, PERCORE_SIZE_LOG2
+	l.add   r4, r3, r4
+	l.lwz   r3, PERCORE_CURRTHREAD(r4)
+	l.lwz   r3, THRD_IPIDATA + IPIDATA_HANDLER(r3)
+
+	LOAD_SYMBOL_2_GPR(r5, KBASE_VIRT)
+	l.sub r3, r3, r5
+	LOAD_SYMBOL_2_GPR(r5, _do_page_vfault)
+	l.sfeq r3, r5
+	l.bf 1f
+	l.nop
+
+	/* If not vfault. */
+	LOAD_SYMBOL_2_GPR(r3, cpus)
+	l.ori  r4, r0, CORE_MASTER
+	l.slli r4, r4, PERCORE_SIZE_LOG2
+	l.add  r4, r3, r4
+	l.lwz  r3, PERCORE_CURRTHREAD(r4)
+	l.j 2f
+	l.nop
+
+	/* If vfault. */
+1:
+	l.lwz  r3, PERCORE_CURRTHREAD(r4)
+2:
+	l.lwz  r7, THRD_INTSTACK(r3) /* intstack. */
+	l.lwz  r3, EEAR(r7)          /* addr.     */
+	l.ori r4, r0, 0              /* err.      */
+	l.ori r5, r0, 0              /* dummy0.   */
+	l.ori r6, r0, 0              /* dummy1.   */
 
 	LOAD_SYMBOL_2_GPR(r13, do_page_fault)
 	l.jalr r13
@@ -831,7 +1168,7 @@ d_not_pte:
 	EXCEPTION_LOAD_GPR6
 	
 	/* Trigger a dtlb miss page fault. */
-	swint_handler 12 _do_page_vfault
+	swint_handler 12 _do_page_vfault + KBASE_VIRT
 
 /*----------------------------------------------------------------------------*
  *                          itlb_miss_handler                                 *
@@ -931,4 +1268,4 @@ i_not_pte:
 	EXCEPTION_LOAD_GPR6
 	
 	/* Trigger a itlb miss page fault. */
-	swint_handler 13 _do_page_vfault
+	swint_handler 13 _do_page_vfault + KBASE_VIRT

@@ -24,11 +24,11 @@
 	#include <or1k/or1k.h>
 
 	/* Interrupt numbers. */
-	#define INT_KEYBOARD 1 /* Keyboard.                                  */
 	#define INT_ATA1    14 /* Primary ATA hard disk.                     */
 	#define INT_ATA2    15 /* Secondary ATA hard disk.                   */
 
 	#define INT_CLOCK      0 /* Timer.                        */
+	#define INT_OMPIC      1 /* OMPIC.                        */
 	#define INT_COM1       2 /* COM1.                         */
 	#define INT_EXTERNAL 256 /* External interrupt indicator. */
 
@@ -70,7 +70,8 @@
 	#define ESR        140
 	
 	/* Stack frame size. */
-	#define INT_FRAME_SIZE 144
+	#define REDZONE 128
+	#define INT_FRAME_SIZE 144+REDZONE
 
 #ifndef _ASM_FILE_
 

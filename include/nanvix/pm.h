@@ -31,9 +31,8 @@
 	#include <nanvix/const.h>
 	#include <nanvix/fs.h>
 	#include <nanvix/hal.h>
+	#include <nanvix/thread.h>
 	#include <nanvix/region.h>
- 	#include <i386/fpu.h>
-	#include <i386/pmc.h>
 	#include <sys/types.h>
 	#include <limits.h>
 	#include <signal.h>
@@ -66,8 +65,7 @@
 	 * @name Process flags
 	 */
 	/**@{*/
-	#define PROC_NEW 0 /**< Is the process new?     */
-	#define PROC_SYS 1 /**< Handling a system call? */
+	#define PROC_NEW 0 /**< Is the process new? */
 	/**@}*/
 	
 	/**
@@ -75,21 +73,7 @@
 	 */
 	/**@{*/
 	#define PROC_QUANTUM 50 /**< Quantum.                  */
-	#define NR_PREGIONS   4 /**< Number of memory regions. */
-	/**@}*/
-	
-	/**
-	 * @name Process priorities
-	 */
-	/**@{*/
-	#define PRIO_IO         -100 /**< Waiting for block operation. */
-	#define PRIO_BUFFER      -80 /**< Waiting for buffer.          */
-	#define PRIO_INODE       -60 /**< Waiting for inode.           */
-	#define PRIO_SUPERBLOCK  -40 /**< Waiting for super block.     */
-	#define PRIO_REGION      -20 /**< Waiting for memory region.   */
-	#define PRIO_TTY           0 /**< Waiting for terminal I/O.    */
-	#define PRIO_SIG          20 /**< Waiting for signal.          */
-	#define PRIO_USER         40 /**< User priority.               */
+	#define NR_PREGIONS   3 /**< Number of memory regions. */
 	/**@}*/
 
 	/**
@@ -109,16 +93,11 @@
 	 * @name Offsets to hard-coded fields of a process
 	 */
 	/**@{*/
-	#define PROC_KESP      0 /**< Kernel stack pointer offset.   */
-	#define PROC_CR3       4 /**< Page directory pointer offset. */
-	#define PROC_INTLVL    8 /**< Interrupt level offset.        */
-	#define PROC_FLAGS    12 /**< Process flags.                 */
-	#define PROC_RECEIVED 16 /**< Received signals offset.       */
-	#define PROC_KSTACK   20 /**< Kernel stack pointer offset.   */
-	#define PROC_RESTORER 24 /**< Signal restorer.               */
-	#define PROC_HANDLERS 28 /**< Signal handlers offset.        */
-	#define PROC_IRQLVL 120  /**< IRQ Level offset.              */
-	#define PROC_FSS    124  /**< FPU Saved Status offset.       */
+	#define PROC_CR3       0 /**< Page directory pointer offset. */
+	#define PROC_FLAGS     4 /**< Process flags.                 */
+	#define PROC_RECEIVED  8 /**< Received signals offset.       */
+	#define PROC_RESTORER 12 /**< Signal restorer.               */
+	#define PROC_HANDLERS 16 /**< Signal handlers offset.        */
 	/**@}*/
 
 #ifndef _ASM_FILE_
@@ -132,22 +111,17 @@
 		 * @name Hard-coded Fields
 		 */
 		/**@{*/
-    	dword_t kesp;                      /**< Kernel stack pointer.   */
-    	dword_t cr3;                       /**< Page directory pointer. */
-		dword_t intlvl;                    /**< Interrupt level.        */
+		dword_t cr3;                       /**< Page directory pointer. */
 		unsigned flags;                    /**< Process flags.          */
-    	unsigned received;                 /**< Received signals.       */
-    	void *kstack;                      /**< Kernel stack pointer.   */
-    	void (*restorer)(void);            /**< Signal restorer.        */
+		unsigned received;                 /**< Received signals.       */
+		void (*restorer)(void);            /**< Signal restorer.        */
 		sighandler_t handlers[NR_SIGNALS]; /**< Signal handlers.        */
-		unsigned irqlvl;                   /**< Current IRQ level.      */
-    	struct fpu fss;                    /**< FPU Saved Status.       */
-    	struct pmc pmcs;                   /**< PMC status.             */
 		/**@}*/
 
-    	/**
-    	 * @name Memory information
-    	 */
+
+		/**
+		 * @name Memory information
+		 */
 		/**@{*/
 		struct pde *pgdir;                 /**< Page directory.         */
 		struct pregion pregs[NR_PREGIONS]; /**< Process memory regions. */
@@ -165,7 +139,7 @@
 		mode_t umask;                  /**< User file's creation mask. */
 		dev_t tty;                     /**< Associated tty device.     */
 		/**@}*/
-		
+
 		/**
 		 * @name General information
 		 */
@@ -179,33 +153,39 @@
 		gid_t gid;              /**< Group ID.                */
 		gid_t egid;             /**< Effective group user ID. */
 		gid_t sgid;             /**< Saved set-group-ID.      */
-    	pid_t pid;              /**< Process ID.              */
-    	struct process *pgrp;   /**< Process group ID.        */
-    	struct process *father; /**< Father process.          */
+		pid_t pid;              /**< Process ID.              */
+		struct process *pgrp;   /**< Process group ID.        */
+		struct process *father; /**< Father process.          */
 		char name[NAME_MAX];    /**< Process name.            */
 		/**@}*/
 
-    	/**
-    	 * @name Timing information
-    	 */
+		/**
+		 * @name Timing information
+		 */
 		/**@{*/
-    	unsigned utime;  /**< User CPU time.                          */
-    	unsigned ktime;  /**< Kernel CPU time.                        */
+		unsigned utime;  /**< User CPU time.                          */
+		unsigned ktime;  /**< Kernel CPU time.                        */
 		unsigned cutime; /**< User CPU time of terminated children.   */
 		unsigned cktime; /**< Kernel CPU time of terminated children. */
 		/**@}*/
 
-    	/**
-    	 * @name Scheduling information
-    	 */
+		/**
+		 * @name Scheduling information
+		 */
 		/**@{*/
-    	unsigned state;          /**< Current state.          */
-    	int counter;             /**< Remaining quantum.      */
-    	int priority;            /**< Process priorities.     */
-    	int nice;                /**< Nice for scheduling.    */
-    	unsigned alarm;          /**< Alarm.                  */
+		unsigned state;          /**< Current state.          */
+		int counter;             /**< Remaining quantum.      */
+		int nice;                /**< Nice for scheduling.    */
+		unsigned alarm;          /**< Alarm.                  */
 		struct process *next;    /**< Next process in a list. */
 		struct process **chain;  /**< Sleeping chain.         */
+		/**@}*/
+
+		/**
+		 * @name Threads information
+		 */
+		/**@{*/
+		struct thread *threads; /**< Process threads. */
 		/**@}*/
 	};
 	
@@ -214,13 +194,19 @@
 	EXTERN void die(int);
 	EXTERN int issig(void);
 	EXTERN void pm_init(void);
-	EXTERN void sched(struct process *);
+	EXTERN void sched(struct thread *);
+	EXTERN void sched_process(struct process *);
+	EXTERN void sched_blocking_thread(struct process *);
+	EXTERN void wakeup_join();
 #ifdef BUILDING_KERNEL
-	EXTERN void sleep(struct process **, int);
+	EXTERN void sleep(struct thread **, int);
 #endif
 	EXTERN void sndsig(struct process *, int);
-	EXTERN void wakeup(struct process **);
-	EXTERN void yield(void);
+	EXTERN void wakeup(struct thread **);
+	EXTERN void (*yield)(void);
+	EXTERN void yield_up(void);
+	EXTERN void yield_smp(void);
+	EXTERN struct thread *waiting_chain;
 	
 	/**
 	 * @name Process memory regions
@@ -228,19 +214,18 @@
 	/**@{*/
 	#define TEXT(p)  (&p->pregs[0]) /**< Text region.  */
 	#define DATA(p)  (&p->pregs[1]) /**< Data region.  */
-	#define STACK(p) (&p->pregs[2]) /**< Stack region. */
-	#define HEAP(p)  (&p->pregs[3]) /**< Heap region.  */
+	#define HEAP(p)  (&p->pregs[2]) /**< Heap region.  */
 	/**@}*/
 	
 	/**
-	 * @brief Asserts if a process was running in kernel mode.
+	 * @brief Asserts if a thread was running in kernel mode.
 	 * 
-	 * @param p Process to be queried about.
+	 * @param t Thread to be queried about.
 	 * 
-	 * @returns True if the process is running in kernel mode, and false
+	 * @returns True if the thread is running in kernel mode, and false
 	 *          otherwise.
 	 */
-	#define KERNEL_WAS_RUNNING(p) (((p)->intlvl > 1))
+	#define KERNEL_WAS_RUNNING(t) (((t)->intlvl > 1))
 	
 	/**
 	 * @brief Asserts if a process is the sessions leader.
@@ -272,7 +257,8 @@
 	#define IS_SUPERUSER(p) \
 		(((p)->uid == SUPERUSER) || ((p)->euid == SUPERUSER))
 	
-	/* Forward definitions. */	
+	/* Forward definitions. */
+	EXTERN int process_is_ready(struct process *);
 	EXTERN void resume(struct process *);
 	EXTERN void stop(void);
 	

@@ -40,7 +40,8 @@
 	#define REGION_PGTABS (16) /* # Page tables.     */
 
 	/* Size (in bytes). */
-	#define REGION_SIZE   ((size_t)REGION_PGTABS*MREGIONS*PGTAB_SIZE)
+	#define REGION_SIZE_CPP REGION_PGTABS*MREGIONS*PGTAB_SIZE
+	#define REGION_SIZE     ((size_t)REGION_SIZE_CPP)
 
  	/* Mini region dimensions. */
 	#define NR_MINIREGIONS (128) /* # Mini regions.            */
@@ -69,7 +70,7 @@
 		int count;                         /* Reference count.            */
 		size_t size;                       /* Region size.                */
 		struct miniregion *mtab[MREGIONS]; /* Mini region.                */
-		struct process *chain;             /* Sleeping chain.             */
+		struct thread *chain;              /* Sleeping chain.             */
 		struct pregion *preg;              /* Process region attached to. */
 		
 		/* File information. */

@@ -22,6 +22,7 @@
 #include <nanvix/hal.h>
 #include <nanvix/klib.h>
 #include <nanvix/pm.h>
+#include <nanvix/smp.h>
 
 /**
  * @brief Clock interrupts since system initialization.
@@ -44,11 +45,12 @@ PRIVATE unsigned rate = 0;
 PRIVATE void clock_event()
 {
 	unsigned new_clock;
-	new_clock = rate;
+	new_clock  = mfspr(SPR_TTCR);
+	new_clock += rate;
 	new_clock &= SPR_TTMR_TP;
 
 	/* Set counter. */
-	mtspr(SPR_TTMR, SPR_TTMR_RT | SPR_TTMR_IE | new_clock);
+	mtspr(SPR_TTMR, SPR_TTMR_CR | SPR_TTMR_IE | new_clock);
 }
 
 /*
@@ -56,21 +58,43 @@ PRIVATE void clock_event()
  */
 PRIVATE void do_clock()
 {
+	/* Timer ACK. */
+	mtspr(SPR_TTMR, SPR_TTMR_CR);
+
 	ticks++;
 	
-	if (KERNEL_WAS_RUNNING(curr_proc))
+	if (!smp_enabled)
 	{
-		curr_proc->ktime++;
-		clock_event();
-		return;
-	}
-	
-	curr_proc->utime++;
-	clock_event();
+		if (KERNEL_WAS_RUNNING(cpus[curr_core].curr_thread))
+		{
+			curr_proc->ktime++;
+			clock_event();
+			return;
+		}
 		
-	/* Give up processor time. */
-	if (--curr_proc->counter == 0)
-		yield();
+		curr_proc->utime++;
+		clock_event();
+			
+		/* Give up processor time. */
+		if (--cpus[curr_core].curr_thread->counter == 0)
+			yield();
+	}
+	else
+	{
+		if (curr_core != CORE_MASTER)
+		{
+			curr_proc->ktime++;
+			clock_event();
+			return;
+		}
+
+		curr_proc->utime++;
+		clock_event();
+
+		/* Give up processor time. */
+		if (--curr_proc->counter == 0)
+			yield();
+	}
 }
 
 /*
@@ -91,12 +115,6 @@ PUBLIC void clock_init(unsigned freq)
 	rate = (CPU_CLOCK << 2)/freq;
 
 	/* Ensures that the clock is disabled. */
-	mtspr(SPR_TTMR, SPR_TTMR_RT | SPR_TTMR_IE | rate);
 	mtspr(SPR_TTCR, 0);
-
-	/* Setup the clock event. */
-	clock_event();
-
-	/* Unmask Timer Interrupt. */
-	mtspr(SPR_SR, mfspr(SPR_SR) | SPR_SR_TEE);
+	mtspr(SPR_TTMR, SPR_TTMR_CR | SPR_TTMR_IE | rate);
 }

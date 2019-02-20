@@ -1,6 +1,6 @@
 /*
  * Copyright(C) 2011-2016 Pedro H. Penna   <pedrohenriquepenna@gmail.com>
- *              2015-2016 Davidson Francis <davidsondfgl@hotmail.com>
+ *              2015-2018 Davidson Francis <davidsondfgl@hotmail.com>
  *
  * This file is part of Nanvix.
  *
@@ -24,6 +24,7 @@
 #include <nanvix/klib.h>
 #include <nanvix/mm.h>
 #include <nanvix/pm.h>
+#include <nanvix/smp.h>
 #include <elf.h>
 #include <errno.h>
 
@@ -343,6 +344,8 @@ PUBLIC int sys_execve(const char *filename, const char **argv, const char **envp
 	addr_t sp;            /* User stack pointer.  */
 	char *pathname;       /* Path name.           */
 	char stack[ARG_MAX];  /* Stack size.          */
+    struct thread *t;
+
 
 	/* Get path name. */
 	if ((pathname = getname(filename)) == NULL)
@@ -400,6 +403,19 @@ PUBLIC int sys_execve(const char *filename, const char **argv, const char **envp
 	/* Detach process memory regions. */
 	for (i = 0; i < NR_PREGIONS; i++)
 		detachreg(curr_proc, &curr_proc->pregs[i]);
+
+	 /* Clear current threads. */
+	detachreg(curr_proc, &cpus[curr_core].curr_thread->pregs);
+
+	/* Clear other threads. */
+	t = curr_proc->threads;
+	while (t != NULL)
+	{
+		if (t != cpus[curr_core].curr_thread)
+			clear_thread(t);
+		t = t->next;
+	}
+
 	
 	/* Load executable. */
 	if (!(entry = load_elf32(inode)))
@@ -408,7 +424,7 @@ PUBLIC int sys_execve(const char *filename, const char **argv, const char **envp
 	/* Attach stack region. */
 	if ((reg = allocreg(S_IRUSR | S_IWUSR, PAGE_SIZE, REGION_DOWNWARDS)) == NULL)
 		goto die0;
-	if (attachreg(curr_proc, STACK(curr_proc), USTACK_ADDR - 1, reg))
+	if (attachreg(curr_proc, &cpus[curr_core].curr_thread->pregs, USTACK_ADDR - 1, reg))
 		goto die1;
 	unlockreg(reg);
 
@@ -428,8 +444,6 @@ PUBLIC int sys_execve(const char *filename, const char **argv, const char **envp
 	kmemcpy((void *)(USTACK_ADDR - ARG_MAX), stack, ARG_MAX);
 	
 	user_mode(entry, sp);
-	
-	/* Will not return. */
 	return (0);
 
 die1:

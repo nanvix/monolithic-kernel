@@ -1,6 +1,6 @@
 /*
  * Copyright(C) 2011-2016 Pedro H. Penna   <pedrohenriquepenna@gmail.com>
- *              2017-2017 Davidson Francis <davidsondfgl@gmail.com>
+ *              2017-2018 Davidson Francis <davidsondfgl@gmail.com>
  * 
  * This file is part of Nanvix.
  * 
@@ -24,6 +24,7 @@
 #include <nanvix/klib.h>
 #include <nanvix/mm.h>
 #include <nanvix/pm.h>
+#include <nanvix/smp.h>
 #include <signal.h>
 
 /**
@@ -39,7 +40,8 @@ PUBLIC int shutting_down = 0;
 PUBLIC void die(int status)
 {
 	struct process *p;
-	
+	struct thread *t;
+
 	/* Shall not occour. */
 	if (curr_proc == IDLE)
 		kpanic("idle process dying");
@@ -99,7 +101,16 @@ PUBLIC void die(int status)
 	/* Detach process memory regions. */
 	for (unsigned i = 0; i < NR_PREGIONS; i++)
 		detachreg(curr_proc, &curr_proc->pregs[i]);
-	
+
+	/* Force threads regions to detach if this wasn't done previously. */
+	t = curr_proc->threads;
+	while (t != NULL)
+	{
+		detachreg(curr_proc, &t->pregs);
+		t->state = THRD_TERMINATED;
+		t = t->next;
+	}
+
 	/* Release root and pwd. */
 	inode_put(curr_proc->root);
 	inode_put(curr_proc->pwd);
@@ -107,12 +118,14 @@ PUBLIC void die(int status)
 	curr_proc->state = PROC_ZOMBIE;
 	curr_proc->alarm = 0;
 
+
+
 	/* Resets the counter if any. */
-	if (curr_proc->pmcs.enable_counters != 0)
+	if (cpus[curr_core].curr_thread->pmcs.enable_counters != 0)
 		pmc_init();
 	
 	sndsig(curr_proc->father, SIGCHLD);
-	
+	wakeup_join();
 	yield();
 }
 
@@ -123,8 +136,16 @@ PUBLIC void die(int status)
  */
 PUBLIC void bury(struct process *proc)
 {
+	struct thread *t;
+	t = proc->threads;
+	while (t != NULL)
+	{
+		t->state = THRD_DEAD;
+		t = t->next;
+	}
 	dstrypgdir(proc);
 	proc->state = PROC_DEAD;
 	proc->father->nchildren--;
 	nprocs--;
+	wakeup_join();
 }

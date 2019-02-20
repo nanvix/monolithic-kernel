@@ -40,12 +40,15 @@
 
 #include <nanvix/mm.h>
 #include <nanvix/pm.h>
+#include <nanvix/smp.h>
 #include <or1k/or1k.h>
 #include <or1k/asm_defs.h>
+#include <or1k/int.h>
 #include <fs/minix.h>
 
 /* Exported symbols. */
 .globl start
+.globl slave_idle
 .globl idle_pgdir
 
 /*============================================================================*
@@ -63,7 +66,15 @@
  */
 start:
 
-	/* Surpervisor mode. */
+	/* If SMP enabled, lock other cores, except core 0. */
+	l.mfspr r3, r0, SPR_COREID
+	l.sfnei r3, 1
+	l.bf 1f
+	l.nop
+	l.j start_secondary_cores
+	l.nop
+1:
+	/* Supervisor mode. */
 	l.ori	r1, r0, 0x1
 	l.mtspr	r0, r1, SPR_SR
 
@@ -144,6 +155,17 @@ start:
 	l.ori r2, r2, PT_L | PT_PRESENT
 	l.sw 0(r1), r2
 	
+	LOAD_SYMBOL_2_GPR(r1, ompic_pgtab)    /* OMPIC at 0xc5000000              */
+	l.srli r1, r1, PAGE_SHIFT
+	l.slli r1, r1, PT_SHIFT
+	l.ori  r1, r1, PT_PRESENT
+	l.sw  PTE_SIZE*197(r3), r1
+
+	LOAD_SYMBOL_2_GPR(r1, ompic_pgtab)
+	LOAD_SYMBOL_2_GPR(r2, 0x13000000)
+	l.ori r2, r2, PT_L | PT_PRESENT
+	l.sw 0(r1), r2
+
 	/* Flush TLB. */
 	l.jal boot_tlb_flush
 	l.nop
@@ -223,6 +245,92 @@ start:
 	loop:
 		l.j loop
 	l.nop
+
+/*----------------------------------------------------------------------------*
+ *                          start_secondary_cores                             *
+ *----------------------------------------------------------------------------*/
+
+/*
+ * Kernel entry point for secondary cores.
+ */
+start_secondary_cores:
+
+	/* Spinlock waiting to initialize. */
+	l.mfspr r3, r0, SPR_COREID
+	LOAD_SYMBOL_2_GPR(r4, KBASE_VIRT)
+	LOAD_SYMBOL_2_GPR(r5, release_cpu)
+	l.sub r5, r5, r4
+
+	l.lwa  r6, 0(r5)
+	l.sfeq r6, r3
+	l.bnf start_secondary_cores
+	l.nop
+
+	secondary_init:
+
+		/* == Proceed initializing == */
+		
+		/* Supervisor mode. */
+		l.ori	r1, r0, 0x1
+		l.mtspr	r0, r1, SPR_SR
+
+		/* Enable Instruction Cache. */
+		l.jal _ic_enable
+		l.nop
+
+		/* Enable Data Cache. */
+		l.jal _dc_enable
+		l.nop
+
+		/* Enabling IMMU/DMMU */
+		l.jal enable_mmu
+		l.nop
+
+		/* Flush TLB. */
+		l.jal boot_tlb_flush
+		l.nop
+
+		/* TODO: Setup stack. */
+
+		/* Enable OMPIC interrupts. */
+		l.ori   r3, r0, (1 << INT_OMPIC)
+		l.mtspr	r0, r3, SPR_PICMR
+
+		/* Enable HW interrupts. */
+		l.mfspr r3, r0, SPR_SR
+		l.ori	r3, r3, lo(SPR_SR_IEE)
+		l.mtspr	r0, r3, SPR_SR
+
+		/* Setup kstack. */
+		LOAD_SYMBOL_2_GPR(r3, cpus_kstack)
+		l.mfspr r4, r0, SPR_COREID
+		l.slli  r4, r4, PAGE_SHIFT
+		l.add   r3, r3, r4
+
+		l.addi r3, r3,  256
+		l.addi r3, r3, -DWORD_SIZE
+		l.or   r1, r3,  r0 /* Stack pointer. */  
+		l.or   r2, r1,  r0 /* Frame pointer. */
+
+		/* Unlock boot_lock. */
+		LOAD_SYMBOL_2_GPR(r3, boot_lock)
+		LOAD_SYMBOL_2_GPR(r5, spin_unlock)
+		l.jalr r5
+		l.nop
+
+	slave_idle:
+		LOAD_SYMBOL_2_GPR(r3, cpus)
+		l.mfspr r5, r0, SPR_COREID
+		l.slli  r5, r5, PERCORE_SIZE_LOG2
+		l.add   r5, r3, r5
+		l.lwz   r3, PERCORE_STATE(r5)
+
+		l.sfnei r3, CORE_RUNNING
+		l.bf slave_idle
+		l.nop
+		
+		l.jr r9
+		l.nop
 
 /*----------------------------------------------------------------------------*
  *                            boot_tlb_flush                                  *
@@ -432,6 +540,17 @@ initrd_pgtab:
  */
 .align PAGE_SIZE
 uart8250_pgtab:
+	.fill PAGE_SIZE/PTE_SIZE, PTE_SIZE, 0
+
+/*----------------------------------------------------------------------------*
+ *                                 ompic_pgtab                                *
+ *----------------------------------------------------------------------------*/
+
+/* 
+ * OMPIC page table.
+ */
+.align PAGE_SIZE
+ompic_pgtab:
 	.fill PAGE_SIZE/PTE_SIZE, PTE_SIZE, 0
 
 /*----------------------------------------------------------------------------*
